@@ -1,0 +1,422 @@
+/*
+ * DS3231 library for the Arduino.
+ *
+ * This library implements the following features:
+ *
+ * - read/write of current time, both of the alarms,
+ * control/status registers, aging register
+ * - read of the temperature register, and of any address from the chip.
+ *
+ * Author:          Petre Rodan <petre.rodan@simplex.ro>
+ * Available from:  https://github.com/rodan/ds3231
+ *
+ * The DS3231 is a low-cost, extremely accurate I2C real-time clock
+ * (RTC) with an integrated temperature-compensated crystal oscillator
+ * (TCXO) and crystal.
+ *
+ * GNU GPLv3 license:
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+#include <stdio.h>
+#include "i2c.h"
+#include "ds3231.h"
+
+// timekeeping registers
+#define DS3231_TIME_CAL_ADDR        0x00
+#define DS3231_ALARM1_ADDR          0x07
+#define DS3231_ALARM2_ADDR          0x0B
+#define DS3231_CONTROL_ADDR         0x0E
+#define DS3231_STATUS_ADDR          0x0F
+#define DS3231_AGING_OFFSET_ADDR    0x10
+#define DS3231_TEMPERATURE_ADDR     0x11
+
+// control register bits
+#define DS3231_A1IE     0x1
+#define DS3231_A2IE     0x2
+
+// status register bits
+#define DS3231_A1F      0x1
+#define DS3231_A2F      0x2
+#define DS3231_OSF      0x80
+
+static struct ts rtctime;
+static struct DS3231 rtc;
+
+/* control register 0Eh/8Eh
+ * bit7 EOSC   Enable Oscillator (1 if oscillator must be stopped when on battery)
+ * bit6 BBSQW  Battery Backed Square Wave
+ * bit5 CONV   Convert temperature (1 forces a conversion NOW)
+ * bit4 RS2    Rate select - frequency of square wave output
+ * bit3 RS1    Rate select
+ * bit2 INTCN  Interrupt control (1 for use of the alarms and to disable square wave)
+ * bit1 A2IE   Alarm2 interrupt enable (1 to enable)
+ * bit0 A1IE   Alarm1 interrupt enable (1 to enable)
+ */
+
+// helpers
+static uint8_t dectobcd(const uint8_t val)
+{
+	return ((val / 10 * 16) + (val % 10));
+}
+
+static uint8_t bcdtodec(const uint8_t val)
+{
+	return ((val / 16 * 10) + (val % 16));
+}
+
+//static uint8_t inp2toi(char *cmd, const uint16_t seek)
+//{
+//	uint8_t rv;
+//	rv = (cmd[seek] - 48) * 10 + cmd[seek + 1] - 48;
+//	return rv;
+//}
+
+static void DS3231_set(struct ts t)
+{
+	uint8_t i, century;
+
+	if (t.year > 2000) {
+		century = 0x80;
+		t.year_s = t.year - 2000;
+	} else {
+		century = 0;
+		t.year_s = t.year - 1900;
+	}
+
+	uint8_t TimeDate[7] = { t.sec, t.min, t.hour, t.wday, t.mday, t.mon, t.year_s };
+
+	I2CStart(DS3231_I2C_ADDR);
+	I2CWriteByte(DS3231_TIME_CAL_ADDR);
+	for (i = 0; i <= 6; i++) {
+		TimeDate[i] = dectobcd(TimeDate[i]);
+		if (i == 5)
+			TimeDate[5] += century;
+		I2CWriteByte(TimeDate[i]);
+	}
+	I2CStop();
+}
+
+static void DS3231_get(struct ts *t)
+{
+	uint8_t TimeDate[7];			//second,minute,hour,dow,day,month,year
+	uint8_t century = 0;
+	uint8_t i, n;
+	uint16_t year_full;
+
+	I2CStart(DS3231_I2C_ADDR);
+	I2CWriteByte(DS3231_TIME_CAL_ADDR);
+	I2CStop();
+
+	I2CStart(DS3231_I2C_ADDR | I2C_READ);
+	for (i = 0; i <= 6; i++) {
+		if (i == 6)
+			I2CReadByte(&n, I2C_NOACK);
+		else
+			I2CReadByte(&n, I2C_ACK);
+
+		if (i == 5) {
+			TimeDate[5] = bcdtodec(n & 0x1F);
+			century = (n & 0x80) >> 7;
+		} else
+			TimeDate[i] = bcdtodec(n);
+	}
+	I2CStop();
+
+	if (century == 1)
+		year_full = 2000 + TimeDate[6];
+	else
+		year_full = 1900 + TimeDate[6];
+
+	t->sec = TimeDate[0];
+	t->min = TimeDate[1];
+	t->hour = TimeDate[2];
+	t->mday = TimeDate[4];
+	t->mon = TimeDate[5];
+	t->year = year_full;
+	t->wday = TimeDate[3];
+	t->year_s = TimeDate[6];
+}
+
+static void DS3231_set_addr(const uint8_t addr, const uint8_t val)
+{
+	I2CStart(DS3231_I2C_ADDR);
+	I2CWriteByte(addr);
+	I2CWriteByte(val);
+	I2CStop();
+}
+
+static uint8_t DS3231_get_addr(const uint8_t addr)
+{
+	uint8_t rv;
+
+	I2CStart(DS3231_I2C_ADDR);
+	I2CWriteByte(addr);
+	I2CStop();
+
+	I2CStart(DS3231_I2C_ADDR | I2C_READ);
+	I2CReadByte(&rv, I2C_NOACK);
+	I2CStop();
+
+	return rv;
+}
+
+// control register
+static void DS3231_set_creg(const uint8_t val)
+{
+	DS3231_set_addr(DS3231_CONTROL_ADDR, val);
+}
+
+/*
+ * status register 0Fh/8Fh
+ * bit7 OSF      Oscillator Stop Flag (if 1 then oscillator has stopped and date might be innacurate)
+ * bit3 EN32kHz  Enable 32kHz output (1 if needed)
+ * bit2 BSY      Busy with TCXO functions
+ * bit1 A2F      Alarm 2 Flag - (1 if alarm2 was triggered)
+ * bit0 A1F      Alarm 1 Flag - (1 if alarm1 was triggered)
+ */
+static void DS3231_set_sreg(const uint8_t val)
+{
+	DS3231_set_addr(DS3231_STATUS_ADDR, val);
+}
+
+static uint8_t DS3231_get_sreg(void)
+{
+	uint8_t rv;
+	rv = DS3231_get_addr(DS3231_STATUS_ADDR);
+
+	return rv;
+}
+
+// aging register
+static void DS3231_set_aging(const int8_t val)
+{
+	uint8_t reg;
+
+	if (val >= 0)
+		reg = val;
+	else
+		reg = ~(-val) + 1;      // 2C
+
+	DS3231_set_addr(DS3231_AGING_OFFSET_ADDR, reg);
+}
+
+static int8_t DS3231_get_aging(void)
+{
+	uint8_t reg;
+	int8_t rv;
+
+	reg = DS3231_get_addr(DS3231_AGING_OFFSET_ADDR);
+
+	if ((reg & 0x80) != 0)
+		rv = reg | ~((1 << 8) - 1);     // if negative get two's complement
+	else
+		rv = reg;
+
+	return rv;
+}
+
+// temperature register
+static float DS3231_get_treg(void)
+{
+	float rv;
+	uint8_t temp_msb, temp_lsb;
+	int8_t nint;
+
+	I2CStart(DS3231_I2C_ADDR);
+	I2CWriteByte(DS3231_TEMPERATURE_ADDR);
+	I2CStop();
+
+	I2CStart(DS3231_I2C_ADDR | I2C_READ);
+	I2CReadByte(&temp_msb, I2C_ACK);
+	I2CReadByte(&temp_lsb, I2C_NOACK);
+	I2CStop();
+
+	temp_lsb >>= 6;
+
+	if ((temp_msb & 0x80) != 0)
+		nint = temp_msb | ~((1 << 8) - 1);      // if negative get two's complement
+	else
+		nint = temp_msb;
+
+	rv = 0.25 * temp_lsb + nint;
+
+	return rv;
+}
+
+// alarms
+// flags are: A1M1 (seconds), A1M2 (minutes), A1M3 (hour), 
+// A1M4 (day) 0 to enable, 1 to disable, DY/DT (dayofweek == 1/dayofmonth == 0)
+static void DS3231_set_a1(const uint8_t s, const uint8_t mi, const uint8_t h, const uint8_t d, const uint8_t * flags)
+{
+	uint8_t t[4] = { s, mi, h, d };
+	uint8_t i;
+
+	I2CStart(DS3231_I2C_ADDR);
+	I2CWriteByte(DS3231_ALARM1_ADDR);
+
+	for (i = 0; i <= 3; i++) {
+		if (i == 3) {
+			I2CWriteByte(dectobcd(t[3]) | (flags[3] << 7) | (flags[4] << 6));
+		} else
+			I2CWriteByte(dectobcd(t[i]) | (flags[i] << 7));
+	}
+
+	I2CStop();
+}
+
+static void DS3231_get_a1(char *buf, const uint8_t len)
+{
+	uint8_t n[4];
+	uint8_t t[4];               //second,minute,hour,day
+	uint8_t f[5];               // flags
+	uint8_t i;
+
+	I2CStart(DS3231_I2C_ADDR);
+	I2CWriteByte(DS3231_ALARM1_ADDR);
+	I2CStop();
+
+	I2CStart(DS3231_I2C_ADDR | I2C_READ);
+
+	for (i = 0; i <= 3; i++) {
+		if (i == 3)
+			I2CReadByte(&n[i], I2C_NOACK);
+		else
+			I2CReadByte(&n[i], I2C_ACK);
+
+		f[i] = (n[i] & 0x80) >> 7;
+		t[i] = bcdtodec(n[i] & 0x7F);
+	}
+	I2CStop();
+
+	f[4] = (n[3] & 0x40) >> 6;
+	t[3] = bcdtodec(n[3] & 0x3F);
+
+	snprintf(buf, len,
+			 "s%02d m%02d h%02d d%02d fs%d m%d h%d d%d wm%d %d %d %d %d",
+			 t[0], t[1], t[2], t[3], f[0], f[1], f[2], f[3], f[4], n[0],
+			 n[1], n[2], n[3]);
+}
+
+// when the alarm flag is cleared the pulldown on INT is also released
+static void DS3231_clear_a1f(void)
+{
+	uint8_t reg_val;
+
+	reg_val = DS3231_get_sreg() & ~DS3231_A1F;
+	DS3231_set_sreg(reg_val);
+}
+
+static uint8_t DS3231_triggered_a1(void)
+{
+	return  DS3231_get_sreg() & DS3231_A1F;
+}
+
+/*
+ * flags are:
+ * A2M2 (minutes)
+ * A2M3 (hour)
+ * A2M4 (day)
+ *	0 to enable
+ *	1 to disable
+ * DY/DT (dayofweek == 1/dayofmonth == 0)
+ */
+static void DS3231_set_a2(const uint8_t mi, const uint8_t h, const uint8_t d, const uint8_t * flags)
+{
+	uint8_t t[3] = { mi, h, d };
+	uint8_t i;
+
+	I2CStart(DS3231_I2C_ADDR);
+	I2CWriteByte(DS3231_ALARM2_ADDR);
+
+	for (i = 0; i <= 2; i++) {
+		if (i == 2) {
+			I2CWriteByte(dectobcd(t[2]) | (flags[2] << 7) | (flags[3] << 6));
+		} else
+			I2CWriteByte(dectobcd(t[i]) | (flags[i] << 7));
+	}
+
+	I2CStop();
+}
+
+static void DS3231_get_a2(char *buf, const uint8_t len)
+{
+	uint8_t n[3];
+	uint8_t t[3];				//second,minute,hour,day
+	uint8_t f[4];				// flags
+	uint8_t i;
+
+	I2CStart(DS3231_I2C_ADDR);
+	I2CWriteByte(DS3231_ALARM2_ADDR);
+	I2CStop();
+
+	I2CStart(DS3231_I2C_ADDR | I2C_READ);
+
+	for (i = 0; i <= 2; i++) {
+		if (i == 2)
+			I2CReadByte(&n[i], I2C_NOACK);
+		else
+			I2CReadByte(&n[i], I2C_ACK);
+
+		f[i] = (n[i] & 0x80) >> 7;
+		t[i] = bcdtodec(n[i] & 0x7F);
+	}
+	I2CStop();
+
+	f[3] = (n[2] & 0x40) >> 6;
+	t[2] = bcdtodec(n[2] & 0x3F);
+
+	snprintf(buf, len, "m%02d h%02d d%02d fm%d h%d d%d wm%d %d %d %d", t[0],
+			 t[1], t[2], f[0], f[1], f[2], f[3], n[0], n[1], n[2]);
+
+}
+
+// when the alarm flag is cleared the pulldown on INT is also released
+static void DS3231_clear_a2f(void)
+{
+	uint8_t reg_val;
+
+	reg_val = DS3231_get_sreg() & ~DS3231_A2F;
+	DS3231_set_sreg(reg_val);
+}
+
+static uint8_t DS3231_triggered_a2(void)
+{
+	return  DS3231_get_sreg() & DS3231_A2F;
+}
+
+static struct DS3231 rtc = {
+	.time = &rtctime,
+	.set = DS3231_set,
+	.get = DS3231_get,
+	.set_aging = DS3231_set_aging,
+	.get_aging = DS3231_get_aging,
+	.get_treg = DS3231_get_treg,
+	.set_a1 = DS3231_set_a1,
+	.get_a1 = DS3231_get_a1,
+	.clear_a1f = DS3231_clear_a1f,
+	.triggered_a1 = DS3231_triggered_a1,
+	.set_a2 = DS3231_set_a2,
+	.get_a2 = DS3231_get_a2,
+	.clear_a2f = DS3231_clear_a2f,
+	.triggered_a2 = DS3231_triggered_a2,
+};
+
+struct DS3231 *DS3231_init(const uint8_t ctrl_reg)
+{
+	DS3231_set_creg(ctrl_reg);
+
+	return &rtc;
+}
